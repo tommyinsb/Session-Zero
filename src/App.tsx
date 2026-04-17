@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from 'react';
+import { motion } from 'motion/react';
+import { GoogleGenAI } from "@google/genai";
 import { 
   Activity, 
   ChevronRight, 
@@ -164,6 +166,18 @@ const BREATHE_PHASES = [
 // --- PERSISTENCE HELPERS ---
 const STORAGE_KEY = `session-zero-data-${appId}`;
 
+const DEFAULT_DATA = {
+  activeScreeners: { phq9: null, gad7: null, mdq: null, ptsd: null, audit: null, dast: null },
+  tracking: { mood: 5, calmness: 5, sleep: 5, energy: 5 },
+  history: [],
+  journal: "",
+  skillRatings: {},
+  therapyRatings: {},
+  stillStreak: 0,
+  lastStillDate: null,
+  currentPractice: null 
+};
+
 const loadLocalData = () => {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -206,19 +220,15 @@ const App = () => {
   const [breathePhaseIndex, setBreathePhaseIndex] = useState(0);
   const [selectedDuration, setSelectedDuration] = useState(1);
   const [isSessionFinished, setIsSessionFinished] = useState(false);
+  const [activeActivityItem, setActiveActivityItem] = useState<any>(null);
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  
+  // Summary State
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+  const [therapistSummary, setTherapistSummary] = useState<string | null>(null);
 
   // Core App Data
-  const [data, setData] = useState<any>({
-    activeScreeners: { phq9: null, gad7: null, mdq: null, ptsd: null, audit: null, dast: null },
-    tracking: { mood: 5, calmness: 5, sleep: 5, energy: 5 },
-    history: [],
-    journal: "",
-    skillRatings: {},
-    therapyRatings: {},
-    stillStreak: 0,
-    lastStillDate: null,
-    currentPractice: null 
-  });
+  const [data, setData] = useState<any>(DEFAULT_DATA);
 
   // --- OPENING SEQUENCE ---
   useEffect(() => {
@@ -262,9 +272,16 @@ const App = () => {
   }, [isBreathing, beStillMode]);
 
   // --- HANDLERS ---
+  const playSound = () => {
+    const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3');
+    audio.volume = 0.5;
+    audio.play().catch(e => console.log("Audio play prevented", e));
+  };
+
   const handleCompleteStillSession = () => {
     setIsBreathing(false);
     setIsSessionFinished(true);
+    playSound();
     const today = new Date().toDateString();
     const isNewDay = data.lastStillDate !== today;
     updateData({
@@ -305,8 +322,9 @@ const App = () => {
     }, 250);
   };
 
-  const generatePractice = (passedRatings = null, skillToSwapOut = null) => {
-    const checkins = data.history.filter((h: any) => h.type === 'check-in');
+  const generatePractice = (passedRatings = null, skillToSwapOut = null, passedHistory = null) => {
+    const historyToUse = passedHistory || data.history;
+    const checkins = historyToUse.filter((h: any) => h.type === 'check-in');
     if (checkins.length === 0) return;
 
     const currentRatings = passedRatings || data.skillRatings;
@@ -409,10 +427,11 @@ const App = () => {
         skills: chosenSkills,
         therapy: { ...chosenTherapyRaw },
         targetSymptom: primaryTarget,
-        generatedAt: new Date().toDateString()
+        generatedAt: new Date().toDateString(),
+        timestamp: Date.now() // Track precisely when this was generated
       };
 
-      updateData({ ...data, skillRatings: currentRatings, currentPractice: newPractice });
+      updateData({ ...data, history: historyToUse, skillRatings: currentRatings, currentPractice: newPractice });
     }
   };
 
@@ -470,9 +489,87 @@ const App = () => {
     };
     
     updateData(newData);
-    // Trigger practice generation immediately so it's ready for the Trends view
-    setTimeout(() => generatePractice(), 100); 
+    // Trigger practice generation immediately using the fresh history
+    generatePractice(null, null, updatedHistory); 
     setView('trends');
+  };
+
+  const handleResetAllData = () => {
+    updateData(DEFAULT_DATA);
+    setShowResetConfirm(false);
+    setView('home');
+  };
+
+  const generateTherapistSummary = async () => {
+    if (data.history.length === 0) return;
+    
+    setIsGeneratingSummary(true);
+    setTherapistSummary(null);
+    
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      const checkins = data.history.filter((h: any) => h.type === 'check-in').slice(0, 14);
+      const moodAvg = (checkins.reduce((acc: number, curr: any) => acc + curr.tracking.mood, 0) / checkins.length).toFixed(1);
+      const anxietyAvg = (checkins.reduce((acc: number, curr: any) => acc + curr.tracking.calmness, 0) / checkins.length).toFixed(1);
+      
+      const helpfulSkills = Object.entries(data.skillRatings)
+        .filter(([_, r]) => r === 'helpful')
+        .map(([id]) => {
+          const s = LAB_SKILLS.flatMap(cat => cat.skills).find(sk => sk.id === id);
+          return s ? s.name : id;
+        });
+
+      const unhelpfulSkills = Object.entries(data.skillRatings)
+        .filter(([_, r]) => r === 'not-helpful')
+        .map(([id]) => {
+          const s = LAB_SKILLS.flatMap(cat => cat.skills).find(sk => sk.id === id);
+          return s ? s.name : id;
+        });
+
+      const helpfulTherapies = Object.entries(data.therapyRatings)
+        .filter(([_, r]) => r === 'helpful')
+        .map(([id]) => THERAPY_STYLES.find(t => t.id === id)?.name || id);
+
+      const latestScreener = checkins[0]?.screeners || {};
+      const activeScreenerTexts = Object.entries(latestScreener)
+        .filter(([_, val]) => val !== null)
+        .map(([key, val]: any) => `${SCREENER_DATA[key].title}: ${val} (${SCREENER_DATA[key].scoring(val).label})`);
+
+      const prompt = `
+        You are an AI medical assistant for a mental health app called "Session Zero". 
+        Your task is to write a brief, professional, and empathetic summary of a patient's recent mental health data. 
+        This summary is intended for the patient to show or read to their therapist during a visit to facilitate communication.
+
+        Patient Data from the last 14 logs:
+        - Average Mood (1-10, where 10 is light): ${moodAvg}
+        - Average Calmness (1-10, where 10 is still): ${anxietyAvg}
+        - Recent Clinical Screeners: ${activeScreenerTexts.join(', ') || 'None'}
+        - Skills Rated HELPFUL: ${helpfulSkills.join(', ') || 'None'}
+        - Skills Rated NOT HELPFUL: ${unhelpfulSkills.join(', ') || 'None'}
+        - Therapy Modalities the patient liked: ${helpfulTherapies.join(', ') || 'None'}
+        - Recent Journal Keywords: ${checkins.map((c: any) => c.journal).filter(Boolean).join('. ')}
+
+        Instructions:
+        1. Keep the summary under 150 words.
+        2. Use the first person ("My mood has been...") or third person professional ("The data shows...").
+        3. Highlight trends (e.g., if mood is low despite helps).
+        4. Mention which specific techniques the patient is resonating with.
+        5. DO NOT provide medical advice or diagnosis. Just summarize the observations.
+      `;
+
+      const result = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: prompt
+      });
+      
+      setTherapistSummary(result.text || "Unable to generate summary at this time.");
+    } catch (e) {
+      console.error("AI Summary Error", e);
+      setTherapistSummary("There was an error generating your summary. Please try again later.");
+    } finally {
+      setIsGeneratingSummary(false);
+    }
   };
 
   const SparkChart = ({ type }: { type: string }) => {
@@ -506,6 +603,121 @@ const App = () => {
       )}
 
       <div className={`w-full flex flex-col items-center h-full transition-all duration-1000 ${isLoading ? 'blur-2xl opacity-50 pointer-events-none' : 'blur-0 opacity-100'}`}>
+        {/* ACTIVITY DETAIL MODAL */}
+        {activeActivityItem && (
+          <div className="fixed inset-0 z-[150] flex items-end justify-center px-4 pb-0 animate-in fade-in duration-300">
+             <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={() => setActiveActivityItem(null)}></div>
+             <div className="w-full max-w-[320px] bg-[#0d111a] border-t border-x border-slate-800 rounded-t-[32px] p-6 pb-12 z-20 shadow-2xl animate-in slide-in-from-bottom-10 duration-500">
+                <div className="w-12 h-1 bg-slate-800 rounded-full mx-auto mb-6"></div>
+                
+                <div className="flex items-center justify-between mb-8">
+                   <div className="space-y-1">
+                      <p className="text-[10px] font-bold text-indigo-500 uppercase tracking-widest">{activeActivityItem.type === 'check-in' ? 'Session Log' : 'Practice Record'}</p>
+                      <h4 className="text-lg font-light text-slate-100">{new Date(activeActivityItem.date).toLocaleDateString(undefined, { month: 'long', day: 'numeric', year: 'numeric' })}</h4>
+                      <p className="text-[10px] text-slate-500">{new Date(activeActivityItem.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
+                   </div>
+                   <button onClick={() => setActiveActivityItem(null)} className="p-2 bg-slate-900 rounded-full text-slate-500 hover:text-white transition-colors">
+                      <X size={20} />
+                   </button>
+                </div>
+
+                {activeActivityItem.type === 'check-in' && (
+                   <div className="space-y-6">
+                      <div className="grid grid-cols-2 gap-3">
+                         {TRACKERS.map(t => (
+                            <div key={t.id} className="p-3 bg-slate-900/40 border border-slate-800/60 rounded-xl space-y-1">
+                               <p className="text-[8px] font-bold text-slate-600 uppercase tracking-widest leading-none">{t.label}</p>
+                               <div className="flex items-center gap-2">
+                                  <span className="text-lg font-mono text-slate-200">{activeActivityItem.tracking[t.id]}</span>
+                                  <div className="h-1 flex-1 bg-slate-800 rounded-full overflow-hidden">
+                                     <div className="h-full bg-indigo-500" style={{ width: `${(activeActivityItem.tracking[t.id]/10)*100}%` }}></div>
+                                  </div>
+                               </div>
+                            </div>
+                         ))}
+                      </div>
+
+                      {Object.keys(activeActivityItem.screeners || {}).some(k => activeActivityItem.screeners[k] !== null) && (
+                         <div className="space-y-3">
+                            <h5 className="text-[9px] font-bold text-slate-600 uppercase tracking-widest">Clinical Screeners</h5>
+                            <div className="space-y-2">
+                               {Object.entries(activeActivityItem.screeners).map(([key, val]: any) => {
+                                  if (val === null) return null;
+                                  const screener = SCREENER_DATA[key];
+                                  const result = screener.scoring(val);
+                                  return (
+                                     <div key={key} className="flex items-center justify-between p-3 bg-slate-950/40 border border-slate-800/40 rounded-xl">
+                                        <span className="text-[11px] text-slate-400 font-medium">{screener.short} Score: <span className="text-slate-200">{val}</span></span>
+                                        <span className={`text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${result.bg} ${result.color}`}>{result.label}</span>
+                                     </div>
+                                  );
+                               })}
+                            </div>
+                         </div>
+                      )}
+
+                      {activeActivityItem.journal && (
+                         <div className="space-y-2">
+                            <h5 className="text-[9px] font-bold text-slate-600 uppercase tracking-widest">Journal Notes</h5>
+                            <div className="p-4 bg-slate-950/60 border border-slate-800/40 rounded-2xl italic text-[11px] text-slate-400 leading-relaxed">
+                               "{activeActivityItem.journal}"
+                            </div>
+                         </div>
+                      )}
+                   </div>
+                )}
+
+                {activeActivityItem.type === 'be-still' && (
+                   <div className="space-y-6">
+                      <div className="p-8 bg-indigo-500/5 border border-indigo-500/10 rounded-3xl flex flex-col items-center text-center space-y-4">
+                         <div className="w-16 h-16 rounded-full bg-indigo-500/10 flex items-center justify-center text-indigo-400">
+                            <Wind size={32} />
+                         </div>
+                         <div className="space-y-1">
+                            <h5 className="text-lg font-light text-slate-100">{activeActivityItem.mode === 'box' ? 'Box Breathing' : 'Mindful Stillness'}</h5>
+                            <p className="text-2xl font-mono text-indigo-400">{activeActivityItem.duration}m 00s</p>
+                            <p className="text-[10px] text-slate-500 uppercase tracking-widest">Total Duration Completed</p>
+                         </div>
+                      </div>
+                      <p className="text-[11px] text-center text-slate-500 px-4 leading-relaxed">You dedicated this time to regulating your nervous system and practicing presence.</p>
+                   </div>
+                )}
+
+                <button onClick={() => setActiveActivityItem(null)} className="w-full mt-8 py-4 bg-slate-900 border border-slate-800 rounded-2xl font-bold text-[10px] text-slate-400 uppercase tracking-[0.2em] hover:text-white transition-all">Close Details</button>
+             </div>
+          </div>
+        )}
+
+        {/* RESET CONFIRMATION MODAL */}
+        {showResetConfirm && (
+          <div className="fixed inset-0 z-[200] flex items-center justify-center px-6 animate-in fade-in duration-300">
+             <div className="absolute inset-0 bg-black/95" onClick={() => setShowResetConfirm(false)}></div>
+             <div className="bg-[#0f141f] border border-slate-800 p-8 rounded-[32px] w-full max-w-[280px] z-50 text-center space-y-6 shadow-2xl animate-in zoom-in-95 duration-300">
+                <div className="w-16 h-16 rounded-full bg-rose-500/10 flex items-center justify-center text-rose-500 mx-auto">
+                   <AlertCircle size={32} />
+                </div>
+                <div className="space-y-2">
+                   <h4 className="text-lg font-light text-slate-100 italic">Are you sure?</h4>
+                   <p className="text-xs text-slate-500 leading-relaxed">This will permanently delete all your check-ins, history, and streaks. This cannot be undone.</p>
+                </div>
+                <div className="space-y-2 pt-2">
+                   <button 
+                    onClick={handleResetAllData}
+                    className="w-full py-4 bg-rose-600 text-white rounded-2xl font-bold text-xs uppercase tracking-widest hover:bg-rose-500 transition-all"
+                   >
+                    Reset Everything
+                   </button>
+                   <button 
+                    onClick={() => setShowResetConfirm(false)}
+                    className="w-full py-4 bg-slate-900 text-slate-400 rounded-2xl font-bold text-xs uppercase tracking-widest hover:text-white transition-all"
+                   >
+                    Cancel
+                   </button>
+                </div>
+             </div>
+          </div>
+        )}
+
         <div className="w-full max-w-[320px] bg-[#07090F]/90 backdrop-blur-xl border-b border-slate-800/50 sticky top-0 z-50 px-4 pt-4 pb-2">
           <div className="flex flex-col items-center gap-1 mb-1">
             <div className="flex items-center gap-2">
@@ -739,19 +951,69 @@ const App = () => {
                   </div>
 
                   <div className="relative w-64 h-64 flex items-center justify-center">
-                    <div className={`absolute inset-0 rounded-full border-2 transition-all duration-[4000ms] ease-in-out ${isBreathing ? BREATHE_PHASES[breathePhaseIndex].border : 'border-slate-800'} ${isBreathing ? BREATHE_PHASES[breathePhaseIndex].scale : 'scale-100'}`}></div>
-                    <div className={`absolute inset-4 rounded-full border transition-all duration-[4000ms] ease-in-out ${isBreathing ? BREATHE_PHASES[breathePhaseIndex].border : 'border-slate-800/40'} ${isBreathing ? BREATHE_PHASES[breathePhaseIndex].scale : 'scale-100 opacity-20'}`}></div>
-                    
-                    <div className="z-10 text-center space-y-1">
-                      {isBreathing ? (
-                        <>
-                          <p className={`text-2xl font-light tracking-widest transition-colors duration-500 ${BREATHE_PHASES[breathePhaseIndex].textCol}`}>{BREATHE_PHASES[breathePhaseIndex].text}</p>
-                          <p className="text-xs font-mono text-slate-500">{Math.floor(breatheTimeLeft / 60)}:{(breatheTimeLeft % 60).toString().padStart(2, '0')}</p>
-                        </>
-                      ) : (
-                        <button onClick={() => setIsBreathing(true)} className="w-16 h-16 rounded-full bg-indigo-600 text-white flex items-center justify-center hover:bg-indigo-500 transition-all shadow-xl shadow-indigo-500/20"><Play size={24} className="ml-1"/></button>
-                      )}
-                    </div>
+                    {beStillMode === 'box' ? (
+                      <div className="relative w-full h-full flex items-center justify-center">
+                        {/* THE BOX ANIMATION */}
+                        <svg className="absolute inset-0 w-full h-full p-2" viewBox="0 0 100 100">
+                          <rect x="5" y="5" width="90" height="90" fill="none" stroke="currentColor" strokeWidth="0.5" className="text-slate-800" rx="4" />
+                          {isBreathing && (
+                            <motion.rect
+                              x="5" y="5" width="90" height="90"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              className="text-indigo-500"
+                              rx="4"
+                              initial={{ pathLength: 0, pathOffset: 0 }}
+                              animate={{ 
+                                pathLength: 0.25, 
+                                pathOffset: [0, 0.25, 0.5, 0.75, 1] 
+                              }}
+                              transition={{ 
+                                duration: 16, 
+                                ease: "linear", 
+                                repeat: Infinity 
+                              }}
+                            />
+                          )}
+                        </svg>
+                        
+                        <div className="z-10 text-center space-y-1">
+                          {isBreathing ? (
+                            <>
+                              <p className={`text-xl font-light tracking-widest transition-colors duration-500 ${BREATHE_PHASES[breathePhaseIndex].textCol}`}>{BREATHE_PHASES[breathePhaseIndex].text}</p>
+                              <p className="text-[10px] font-mono text-slate-500">{Math.floor(breatheTimeLeft / 60)}:{(breatheTimeLeft % 60).toString().padStart(2, '0')}</p>
+                            </>
+                          ) : (
+                            <button onClick={() => setIsBreathing(true)} className="w-16 h-16 rounded-full bg-indigo-600 text-white flex items-center justify-center hover:bg-indigo-500 transition-all shadow-xl shadow-indigo-500/20"><Play size={24} className="ml-1"/></button>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="relative w-full h-full flex flex-col items-center justify-center p-4">
+                        {isBreathing ? (
+                          <div className="flex flex-col items-center space-y-6 animate-in fade-in duration-1000">
+                            <div className="text-center space-y-4 px-2">
+                               <div className="space-y-1">
+                                  <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-[0.2em]">Mindful Presence</p>
+                                  <p className="text-2xl font-mono text-slate-200">{Math.floor(breatheTimeLeft / 60)}:{(breatheTimeLeft % 60).toString().padStart(2, '0')}</p>
+                               </div>
+                               <div className="space-y-4 text-[11px] leading-relaxed text-slate-400 italic">
+                                  <p>1. Focus on your home base (e.g. breath in nostrils, chest, or belly).</p>
+                                  <p>2. Get really into how it feels.</p>
+                                  <p>3. When distracted, notice it, and return to your home base.</p>
+                               </div>
+                            </div>
+                            <div className="w-12 h-12 rounded-full border border-indigo-500/20 flex items-center justify-center">
+                               <div className="w-2 h-2 bg-indigo-500 rounded-full animate-ping"></div>
+                            </div>
+                          </div>
+                        ) : (
+                          <button onClick={() => setIsBreathing(true)} className="w-16 h-16 rounded-full bg-indigo-600 text-white flex items-center justify-center hover:bg-indigo-500 transition-all shadow-xl shadow-indigo-500/20"><Play size={24} className="ml-1"/></button>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {!isBreathing && (
@@ -839,9 +1101,13 @@ const App = () => {
               <div className="space-y-3">
                 <h3 className="text-[9px] font-bold uppercase tracking-widest text-slate-600 ml-1">Recent Activity</h3>
                 {data.history.slice(0, 10).map((item: any) => (
-                  <div key={item.id} className="p-4 bg-slate-950 border border-slate-800 rounded-2xl flex items-center justify-between">
+                  <button 
+                    key={item.id} 
+                    onClick={() => setActiveActivityItem(item)}
+                    className="w-full p-4 bg-slate-950 border border-slate-800 rounded-2xl flex items-center justify-between hover:border-indigo-500/50 hover:bg-slate-900/40 transition-all text-left group"
+                  >
                     <div className="flex items-center gap-3">
-                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${item.type === 'check-in' ? 'bg-indigo-500/10 text-indigo-400' : 'bg-teal-500/10 text-teal-400'}`}>
+                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center transition-colors ${item.type === 'check-in' ? 'bg-indigo-500/10 text-indigo-400 group-hover:bg-indigo-500 group-hover:text-white' : 'bg-teal-500/10 text-teal-400 group-hover:bg-teal-500 group-hover:text-white'}`}>
                         {item.type === 'check-in' ? <ClipboardCheck size={16}/> : <Wind size={16}/>}
                       </div>
                       <div>
@@ -849,20 +1115,81 @@ const App = () => {
                         <p className="text-[9px] text-slate-500">{new Date(item.date).toLocaleDateString()} • {new Date(item.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
                       </div>
                     </div>
-                    {item.type === 'check-in' && (
-                      <div className="flex gap-1">
-                        {Object.values(item.tracking).map((v: any, i) => (
-                          <div key={i} className="w-1 h-3 bg-slate-800 rounded-full overflow-hidden">
-                            <div className="w-full bg-indigo-500" style={{ height: `${(v/10)*100}%` }}></div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    {item.type === 'be-still' && (
-                      <span className="text-[10px] font-mono text-teal-500">{item.duration}m</span>
-                    )}
-                  </div>
+                    <div className="flex items-center gap-2">
+                      {item.type === 'check-in' && (
+                        <div className="flex gap-0.5">
+                          {Object.values(item.tracking).map((v: any, i) => (
+                            <div key={i} className="w-0.5 h-3 bg-slate-800 rounded-full overflow-hidden">
+                              <div className="w-full bg-indigo-500" style={{ height: `${(v/10)*100}%` }}></div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {item.type === 'be-still' && (
+                        <span className="text-[10px] font-mono text-teal-500">{item.duration}m</span>
+                      )}
+                      <ChevronRight size={12} className="text-slate-700 group-hover:text-slate-400 transition-colors" />
+                    </div>
+                  </button>
                 ))}
+              </div>
+
+              {/* AI THERAPIST SUMMARY SECTION */}
+              <div className="space-y-3 pt-4 border-t border-slate-800/50">
+                <div className="flex items-center justify-between px-1">
+                  <h3 className="text-[9px] font-bold uppercase tracking-widest text-slate-600">Therapist Summary</h3>
+                  {!therapistSummary && !isGeneratingSummary && (
+                    <button 
+                      onClick={generateTherapistSummary}
+                      disabled={data.history.length === 0}
+                      className="flex items-center gap-1 text-[9px] font-bold text-indigo-400 uppercase tracking-widest hover:text-indigo-300 disabled:opacity-30"
+                    >
+                      <Sparkles size={10} />
+                      Generate
+                    </button>
+                  )}
+                </div>
+
+                {isGeneratingSummary ? (
+                   <div className="p-6 bg-slate-900/40 border border-slate-800 rounded-3xl flex flex-col items-center justify-center space-y-3">
+                      <div className="w-5 h-5 border-2 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin"></div>
+                      <p className="text-[10px] text-slate-500 font-medium animate-pulse">Analyzing trends for your visit...</p>
+                   </div>
+                ) : therapistSummary ? (
+                   <div className="p-5 bg-indigo-500/5 border border-indigo-500/10 rounded-3xl space-y-4 animate-in fade-in slide-in-from-bottom-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 text-indigo-400">
+                          <Brain size={14} />
+                          <span className="text-[10px] font-bold uppercase tracking-widest">Visit Summary</span>
+                        </div>
+                        <button onClick={() => setTherapistSummary(null)} className="text-slate-600 hover:text-slate-400"><X size={14}/></button>
+                      </div>
+                      <p className="text-[12px] leading-relaxed text-slate-300 italic whitespace-pre-wrap">{therapistSummary}</p>
+                      <div className="pt-2 flex justify-end">
+                         <button 
+                          onClick={generateTherapistSummary}
+                          className="text-[9px] font-bold text-indigo-500 uppercase tracking-widest flex items-center gap-1 hover:text-indigo-400"
+                        >
+                          <RotateCcw size={10} /> Regenerate
+                        </button>
+                      </div>
+                   </div>
+                ) : data.history.length === 0 ? (
+                  <div className="p-5 bg-slate-900/20 border border-slate-800/40 rounded-2xl text-center">
+                    <p className="text-[10px] text-slate-600">Complete check-ins to unlock AI summaries.</p>
+                  </div>
+                ) : null}
+              </div>
+
+              {/* DATA RESET SECTION */}
+              <div className="pt-10 pb-6 flex justify-center">
+                <button 
+                  onClick={() => setShowResetConfirm(true)}
+                  className="px-4 py-2 text-[9px] font-bold text-slate-700 uppercase tracking-[0.2em] hover:text-rose-500 transition-colors flex items-center gap-2"
+                >
+                  <AlertCircle size={12} />
+                  Clear Data & History
+                </button>
               </div>
             </div>
           )}
@@ -944,21 +1271,16 @@ const App = () => {
                </div>
 
                <div className="space-y-3">
-                  <h3 className="text-[9px] font-bold uppercase tracking-widest text-slate-600 ml-1">Finding a Therapist</h3>
+                  <h3 className="text-[9px] font-bold uppercase tracking-widest text-slate-600 ml-1">Connect to help locally</h3>
                   <div className="space-y-2">
-                    {[
-                      { name: "Psychology Today", desc: "Largest directory of verified therapists.", url: "https://www.psychologytoday.com" },
-                      { name: "TherapyDen", desc: "Inclusive, progressive therapist finder.", url: "https://www.therapyden.com" },
-                      { name: "Open Path Collective", desc: "Affordable, middle-to-low income therapy.", url: "https://openpathcollective.org" }
-                    ].map((r, i) => (
-                      <a key={i} href={r.url} target="_blank" rel="noopener noreferrer" className="block p-4 bg-slate-950 border border-slate-800 rounded-2xl hover:border-slate-600 transition-all">
-                        <div className="flex items-center justify-between mb-1">
-                          <span className="text-[12px] font-medium text-slate-200">{r.name}</span>
-                          <ExternalLink size={12} className="text-slate-600" />
-                        </div>
-                        <p className="text-[10px] text-slate-500">{r.desc}</p>
-                      </a>
-                    ))}
+                     <a href="https://www.psychologytoday.com/us/therapists" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 bg-slate-900/60 border border-slate-800 text-slate-200 rounded-2xl font-bold text-sm hover:border-indigo-500/50 transition-all group">
+                        <span>Find a Therapist</span>
+                        <ExternalLink size={16} className="text-slate-600 group-hover:text-indigo-400" />
+                     </a>
+                     <a href="https://www.zocdoc.com/psychiatrists" target="_blank" rel="noopener noreferrer" className="flex items-center justify-between p-4 bg-slate-900/60 border border-slate-800 text-slate-200 rounded-2xl font-bold text-sm hover:border-indigo-500/50 transition-all group">
+                        <span>Find a Psychiatrist</span>
+                        <ExternalLink size={16} className="text-slate-600 group-hover:text-indigo-400" />
+                     </a>
                   </div>
                </div>
 
