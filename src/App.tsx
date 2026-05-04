@@ -163,6 +163,15 @@ const BREATHE_PHASES = [
   { text: 'Hold', scale: 'scale-100', border: 'border-slate-500', bg: 'bg-slate-500/10', textCol: 'text-slate-400' }
 ];
 
+const QUICK_HELP_MAPPING: Record<string, { symptom: string, skillId: string }> = {
+  'Anxious': { symptom: 'anxiety', skillId: 'box-breath' },
+  'Depressed': { symptom: 'depressive', skillId: 'be-act' },
+  'Unmotivated': { symptom: 'depressive', skillId: 'opp-act' },
+  'Tired': { symptom: 'panic', skillId: 'ice-dive' },
+  'Dissociation': { symptom: 'dissociation', skillId: '54321' },
+  'Panic': { symptom: 'panic', skillId: 'physio-sigh' }
+};
+
 // --- PERSISTENCE HELPERS ---
 const STORAGE_KEY = `session-zero-data-${appId}`;
 
@@ -210,6 +219,7 @@ const App = () => {
   // Lab State
   const [labTab, setLabTab] = useState('self-care'); 
   const [labSelection, setLabSelection] = useState<any>(null);
+  const [quickHelpSymptom, setQuickHelpSymptom] = useState<string | null>(null);
   const [therapySelection, setTherapySelection] = useState<any>(null);
   const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
 
@@ -274,10 +284,46 @@ const App = () => {
     return () => clearInterval(phaseInterval);
   }, [isBreathing, beStillMode]);
 
+  // --- WAKE LOCK (KEEP SCREEN ON) ---
+  useEffect(() => {
+    let wakeLock: any = null;
+
+    const requestWakeLock = async () => {
+      try {
+        if ('wakeLock' in navigator) {
+          wakeLock = await (navigator as any).wakeLock.request('screen');
+        }
+      } catch (err: any) {
+        console.warn(`Wake Lock error: ${err.name}, ${err.message}`);
+      }
+    };
+
+    const handleVisibilityChange = async () => {
+      if (wakeLock !== null && document.visibilityState === 'visible' && isBreathing) {
+        await requestWakeLock();
+      }
+    };
+
+    if (isBreathing) {
+      requestWakeLock();
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    } else {
+      if (wakeLock) {
+        wakeLock.release().then(() => { wakeLock = null; });
+      }
+    }
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (wakeLock) wakeLock.release();
+    };
+  }, [isBreathing]);
+
   // --- HANDLERS ---
   const playSound = () => {
-    const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2568/2568-preview.mp3');
-    audio.volume = 0.5;
+    // Reverted to the resonant sound and confirmed to work (User called it the "chirping bird" one)
+    const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2432/2432-preview.mp3');
+    audio.volume = 0.8;
     audio.play().catch(e => console.log("Audio play prevented", e));
   };
 
@@ -455,14 +501,28 @@ const App = () => {
   const handleRateSkill = (skillId: string, rating: string) => {
     updateData((prev: any) => {
       const newRatings = { ...prev.skillRatings, [skillId]: prev.skillRatings[skillId] === rating ? null : rating };
+      
       if (rating === 'not-helpful') {
+        // Quick Help mode: immediately swap to another skill in the same category
+        if (quickHelpSymptom) {
+          const cat = LAB_SKILLS.find(c => c.id === quickHelpSymptom);
+          if (cat) {
+            const others = cat.skills.filter(s => s.id !== skillId && newRatings[s.id] !== 'not-helpful');
+            if (others.length > 0) {
+              const next = others[Math.floor(Math.random() * others.length)];
+              setLabSelection({ ...next, iconId: cat.iconId });
+            } else {
+              setLabSelection(null);
+              setQuickHelpSymptom(null);
+            }
+          }
+          return { ...prev, skillRatings: newRatings };
+        }
+
         const isCurrentlyInPractice = prev.currentPractice?.skills?.some((s: any) => s.id === skillId);
         if (isCurrentlyInPractice) {
-           // We'll need to update practice too. Functional updates make this slightly trickier if generatePractice isn't pure.
-           // However, generatePractice is already using updateData internally.
-           // To keep it simple, we'll call generatePractice which now uses functional updates.
            generatePractice(newRatings, skillId as any);
-           return prev; // We don't return newRatings here as generatePractice will handle the full state update.
+           return prev; 
         }
       }
       return { ...prev, skillRatings: newRatings };
@@ -766,7 +826,7 @@ const App = () => {
                   <span className="text-[10px] font-bold uppercase tracking-tighter">Back</span>
                </button>
                <h2 className="text-[9px] font-black uppercase tracking-[0.25em] text-indigo-500/80 absolute left-1/2 -translate-x-1/2">
-                 {view === 'track' ? 'Check In' : view === 'lab' ? 'The Lab' : view === 'resources' ? 'Help' : view === 'trends' ? 'My Trends' : view === 'bestill' ? 'Be Still' : view === 'practice' ? 'The Practice' : ''}
+                 {view === 'track' ? 'Check In' : view === 'lab' ? 'The Lab' : view === 'resources' ? 'Help' : view === 'trends' ? 'My Trends' : view === 'bestill' ? 'Be Still' : view === 'practice' ? 'The Practice' : view === 'quick-help' ? 'Quick Help' : ''}
                </h2>
                {view === 'track' && (
                  <button onClick={saveCheckIn} className="text-[10px] font-bold uppercase text-indigo-400 tracking-tighter hover:text-indigo-300">Save</button>
@@ -778,6 +838,12 @@ const App = () => {
         <main className="flex-1 w-full max-w-[320px] overflow-y-auto px-4 pb-24 pt-4">
           {view === 'home' && (
             <div className="flex flex-col items-center w-full space-y-2 animate-in fade-in duration-500">
+              <button onClick={() => setView('quick-help')} className="w-full flex flex-row items-center justify-center p-3 bg-indigo-600/10 border border-indigo-500/20 rounded-2xl gap-3 group relative overflow-hidden transition-all hover:bg-indigo-600/20">
+                <div className="absolute -right-4 -top-4 w-16 h-16 bg-indigo-500/10 rounded-full blur-xl"></div>
+                <Sparkles size={16} className="text-indigo-400" />
+                <h3 className="text-[11px] font-bold text-indigo-400 uppercase tracking-widest">Quick Help</h3>
+              </button>
+
               <button onClick={() => setView('track')} className="w-full flex flex-col items-center justify-center p-6 bg-slate-900/40 border border-slate-800 rounded-2xl gap-2 group relative overflow-hidden transition-all hover:bg-slate-800/50">
                 <div className="absolute -right-4 -top-4 w-24 h-24 bg-indigo-500/5 rounded-full blur-xl group-hover:bg-indigo-500/10 transition-colors"></div>
                 <div className="w-10 h-10 rounded-full bg-indigo-500/10 flex items-center justify-center text-indigo-400 group-hover:text-white group-hover:bg-indigo-500 transition-colors z-10"><MapPin size={20} /></div>
@@ -809,6 +875,49 @@ const App = () => {
                   <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center text-slate-400 group-hover:bg-slate-700 group-hover:text-white transition-colors"><LifeBuoy size={20} /></div>
                   <h3 className="text-[11px] font-medium text-slate-200">Resources</h3>
                 </button>
+              </div>
+            </div>
+          )}
+
+          {view === 'quick-help' && (
+            <div className="space-y-6 pb-10 animate-in slide-in-from-bottom-4 duration-500 px-2 text-center">
+              <div className="space-y-2 mb-8 mt-4">
+                <h2 className="text-xl font-light text-slate-100 italic">I'm feeling...</h2>
+                <p className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">In-the-moment support</p>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2">
+                {Object.keys(QUICK_HELP_MAPPING).map((feeling) => (
+                  <button 
+                    key={feeling} 
+                    onClick={() => {
+                      const mapping = QUICK_HELP_MAPPING[feeling];
+                      const symptomId = mapping.symptom;
+                      setQuickHelpSymptom(symptomId);
+                      const cat = LAB_SKILLS.find(c => c.id === symptomId);
+                      if (cat) {
+                        const randomSkill = cat.skills[Math.floor(Math.random() * cat.skills.length)];
+                        setLabSelection({ ...randomSkill, iconId: cat.iconId });
+                      }
+                    }}
+                    className="w-full py-5 bg-slate-900/40 border border-slate-800 rounded-2xl text-[12px] font-medium text-slate-200 hover:bg-slate-800/50 hover:border-indigo-500/50 transition-all flex items-center justify-center gap-2 group"
+                  >
+                    {feeling === 'Anxious' ? <Wind size={14} className="text-sky-400" /> : 
+                     feeling === 'Depressed' ? <Zap size={14} className="text-yellow-400" /> :
+                     feeling === 'Unmotivated' ? <Target size={14} className="text-emerald-400" /> :
+                     feeling === 'Tired' ? <Zap size={14} className="text-orange-400" /> :
+                     feeling === 'Dissociation' ? <CloudRain size={14} className="text-indigo-400" /> :
+                     <Activity size={14} className="text-rose-400" />}
+                    <span>{feeling}</span>
+                  </button>
+                ))}
+              </div>
+
+              <div className="pt-8">
+                <p className="text-[10px] text-slate-500 italic px-6 leading-relaxed">
+                  These tools are for immediate symptom management. 
+                  For a deeper analysis, please use the check-in.
+                </p>
               </div>
             </div>
           )}
@@ -1321,7 +1430,7 @@ const App = () => {
       {labSelection && (
         <div className="fixed inset-0 z-[110] bg-[#07090F]/95 backdrop-blur-md p-6 flex flex-col items-center animate-in fade-in zoom-in-95 duration-200 overflow-y-auto">
            <div className="w-full max-w-[320px] flex justify-end mb-6">
-              <button onClick={() => setLabSelection(null)} className="p-2 bg-slate-900 rounded-full text-slate-500 hover:text-white transition-colors"><X size={18}/></button>
+              <button onClick={() => { setLabSelection(null); setQuickHelpSymptom(null); }} className="p-2 bg-slate-900 rounded-full text-slate-500 hover:text-white transition-colors"><X size={18}/></button>
            </div>
            <div className="w-full max-w-[320px] space-y-6">
               <div className="text-center space-y-2">
@@ -1350,7 +1459,7 @@ const App = () => {
                  </div>
               </div>
               
-              <button onClick={() => setLabSelection(null)} className="w-full py-4 bg-slate-900 text-slate-400 rounded-2xl font-bold text-xs hover:text-white transition-all">Close</button>
+              <button onClick={() => { setLabSelection(null); setQuickHelpSymptom(null); }} className="w-full py-4 bg-slate-900 text-slate-400 rounded-2xl font-bold text-xs hover:text-white transition-all">Close</button>
            </div>
         </div>
       )}
