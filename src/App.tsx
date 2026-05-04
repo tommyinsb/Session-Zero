@@ -245,9 +245,12 @@ const App = () => {
     }
   }, []);
 
-  const updateData = (newData: any) => {
-    setData(newData);
-    saveLocalData(newData);
+  const updateData = (arg: any) => {
+    setData((prev: any) => {
+      const newData = typeof arg === 'function' ? arg(prev) : arg;
+      saveLocalData(newData);
+      return newData;
+    });
   };
 
   // --- TIMERS ---
@@ -284,12 +287,12 @@ const App = () => {
     playSound();
     const today = new Date().toDateString();
     const isNewDay = data.lastStillDate !== today;
-    updateData({
-        ...data,
-        stillStreak: isNewDay ? (data.stillStreak || 0) + 1 : data.stillStreak,
+    updateData((prev: any) => ({
+        ...prev,
+        stillStreak: isNewDay ? (prev.stillStreak || 0) + 1 : prev.stillStreak,
         lastStillDate: today,
-        history: [{ id: Date.now(), date: new Date().toISOString(), type: 'be-still', mode: beStillMode, duration: selectedDuration }, ...data.history]
-    });
+        history: [{ id: Date.now(), date: new Date().toISOString(), type: 'be-still', mode: beStillMode, duration: selectedDuration }, ...prev.history]
+    }));
   };
 
   const resetBeStill = () => {
@@ -308,10 +311,10 @@ const App = () => {
       const newAnswers = [...screenerAnswers, idx];
       if (newAnswers.length === SCREENER_DATA[activeScreenerId!].questions.length) {
         const total = newAnswers.reduce((acc, v) => acc + v, 0);
-        updateData({
-          ...data,
-          activeScreeners: { ...data.activeScreeners, [activeScreenerId!]: total }
-        });
+        updateData((prev: any) => ({
+          ...prev,
+          activeScreeners: { ...prev.activeScreeners, [activeScreenerId!]: total }
+        }));
         setActiveScreenerId(null);
         setScreenerAnswers([]);
       } else {
@@ -406,7 +409,7 @@ const App = () => {
       ).filter(Boolean);
 
       const newPractice = { ...data.currentPractice, skills: updatedSkills };
-      updateData({ ...data, skillRatings: currentRatings, currentPractice: newPractice });
+      updateData((prev: any) => ({ ...prev, skillRatings: currentRatings, currentPractice: newPractice }));
     } else {
       const chosenSkills = pool.sort(() => 0.5 - Math.random()).slice(0, 2);
       const primaryTarget = eligibleCategories[0];
@@ -431,7 +434,7 @@ const App = () => {
         timestamp: Date.now() // Track precisely when this was generated
       };
 
-      updateData({ ...data, history: historyToUse, skillRatings: currentRatings, currentPractice: newPractice });
+      updateData((prev: any) => ({ ...prev, history: historyToUse, skillRatings: currentRatings, currentPractice: newPractice }));
     }
   };
 
@@ -450,22 +453,27 @@ const App = () => {
   };
 
   const handleRateSkill = (skillId: string, rating: string) => {
-    const newRatings = { ...data.skillRatings, [skillId]: data.skillRatings[skillId] === rating ? null : rating };
-    if (rating === 'not-helpful') {
-      const isCurrentlyInPractice = data.currentPractice?.skills?.some((s: any) => s.id === skillId);
-      if (isCurrentlyInPractice) {
-         generatePractice(newRatings, skillId as any);
-         return;
+    updateData((prev: any) => {
+      const newRatings = { ...prev.skillRatings, [skillId]: prev.skillRatings[skillId] === rating ? null : rating };
+      if (rating === 'not-helpful') {
+        const isCurrentlyInPractice = prev.currentPractice?.skills?.some((s: any) => s.id === skillId);
+        if (isCurrentlyInPractice) {
+           // We'll need to update practice too. Functional updates make this slightly trickier if generatePractice isn't pure.
+           // However, generatePractice is already using updateData internally.
+           // To keep it simple, we'll call generatePractice which now uses functional updates.
+           generatePractice(newRatings, skillId as any);
+           return prev; // We don't return newRatings here as generatePractice will handle the full state update.
+        }
       }
-    }
-    updateData({ ...data, skillRatings: newRatings });
+      return { ...prev, skillRatings: newRatings };
+    });
   };
 
   const handleRateTherapy = (therapyId: string, rating: string) => {
-    updateData({
-      ...data,
-      therapyRatings: { ...data.therapyRatings, [therapyId]: data.therapyRatings[therapyId] === rating ? null : rating }
-    });
+    updateData((prev: any) => ({
+      ...prev,
+      therapyRatings: { ...prev.therapyRatings, [therapyId]: prev.therapyRatings[therapyId] === rating ? null : rating }
+    }));
   };
 
   const saveCheckIn = () => {
@@ -479,17 +487,18 @@ const App = () => {
     };
     
     const updatedHistory = [entry, ...data.history];
-    const newData = {
-      ...data,
+    
+    // First reset the trackers and history
+    updateData((prev: any) => ({
+      ...prev,
       history: updatedHistory,
       tracking: { mood: 5, calmness: 5, sleep: 5, energy: 5 },
       activeScreeners: { phq9: null, gad7: null, mdq: null, ptsd: null, audit: null, dast: null },
       journal: "",
       currentPractice: null 
-    };
+    }));
     
-    updateData(newData);
-    // Trigger practice generation immediately using the fresh history
+    // Then trigger practice generation with the fresh history
     generatePractice(null, null, updatedHistory); 
     setView('trends');
   };
